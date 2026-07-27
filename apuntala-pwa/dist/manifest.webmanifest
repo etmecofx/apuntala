@@ -1,0 +1,15 @@
+{
+  "name": "Apuntala · Apuntalamiento de emergencia",
+  "short_name": "Apuntala",
+  "description": "Cálculo de apuntalamiento de emergencia post-sismo según los Lineamientos Técnicos (Rev. 3, 2026) de la Comisión Presidencial para la Evaluación de Habitabilidad de Infraestructuras. Desarrollo: Ing. Etel Contreras · CIV 192.276.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f5f4ef",
+  "theme_color": "#1f1f1d",
+  "lang": "es",
+  "icons": [
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
