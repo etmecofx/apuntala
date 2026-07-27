@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useRef } from "react";
+import React, { useState, useMemo, useRef, useEffect } from "react";
 
 // ============================================================
 // APUNTALA — Cálculo de apuntalamiento de emergencia · Sismo 24J
@@ -160,6 +160,34 @@ function calcular(inp) {
   return { nv, rd, AT: r2(AT), PT: r2(PT), PA: r2(PA), Vadm: r2(Vadm), Pv: r2(Pv), FS: r2(FS), warnings, filas, totalPuntales, abajo, forzarSup };
 }
 
+// ---------- Motor de viga (reglas 7.2, 8.4.3, 9.2 aplicadas con rd de Tabla A.1 por analogía) ----------
+function calcularViga(i) {
+  const w = (i.q / 1000) * i.at + (i.wpp || 0) / 1000; // tonf/m
+  const La = r2(1.5 * i.L); // luz + 1/4 de luz hacia cada apoyo (7.2)
+  const W = w * La;
+  const rd = i.rd != null ? i.rd : 0;
+  const WA = W * (1 - rd);
+  const Ncarga = Math.max(1, Math.ceil(WA / i.qp - 1e-9));
+  const Nsep = Math.ceil(La / 0.4 - 1e-9) + 1; // separación máx. 0,4 m entre ejes (8.4.3)
+  const N = Math.max(Ncarga, Nsep, 2);
+  const sep = r2(La / (N - 1));
+  const Rapoyo = r2(WA / 2);
+  return { w: r2(w), La, W: r2(W), WA: r2(WA), Ncarga, Nsep, N, sep, Rapoyo };
+}
+
+// ---------- Verificador-especificador de muro (9.4; el dimensionamiento de fuerzas lo define el ingeniero) ----------
+function calcularMuro(i) {
+  const ang = r2((Math.atan2(i.ha, i.db) * 180) / Math.PI);
+  const diag = r2(Math.sqrt(i.ha * i.ha + i.db * i.db));
+  const Lc = r2(i.Lp + 2 * i.Lt); // paño afectado + un paño a cada lado (Tabla 3)
+  const porNivel = Math.max(2, Math.ceil(Lc / i.st - 1e-9) + 1);
+  const total = porNivel * Math.max(1, i.napoyos);
+  const peso = r2((Lc * i.H * 330) / 1000); // mampostería de bloque frisada, Tabla 6 (referencial)
+  return { ang, diag, Lc, porNivel, total, peso, angOK: ang >= 30 && ang <= 60, alturaOK: i.H <= 7 };
+}
+
+const MAPA_CALC = { columna: "columna", varias: "columna", planta: "columna", viga: "viga", muro: "muro", escalera: "columna" };
+
 // Autoverificación contra el Anexo A
 function selfTest() {
   const esperado = [
@@ -195,6 +223,29 @@ const S = {
   banner: (r) => ({ padding: "10px 12px", borderRadius: 8, background: RAMP[r].bg, color: RAMP[r].fg, fontSize: 12, lineHeight: 1.55, marginTop: 10 }),
   row: { border: "1px solid #e3e1d9", borderRadius: 8, padding: "10px 12px", marginBottom: 8 },
 };
+
+// Campo numérico que permite borrar y reescribir libremente; confirma el valor válido y lo restaura al salir si queda vacío.
+function NumField({ value, onCommit, entero, min, step, style }) {
+  const [text, setText] = useState(String(value));
+  const focused = useRef(false);
+  useEffect(() => { if (!focused.current) setText(String(value)); }, [value]);
+  const parse = (t) => {
+    const v = entero ? parseInt(t, 10) : parseFloat(String(t).replace(",", "."));
+    if (isNaN(v)) return null;
+    return min != null && v < min ? null : v;
+  };
+  return (
+    <input
+      style={style || S.input}
+      type="text"
+      inputMode={entero ? "numeric" : "decimal"}
+      value={text}
+      onFocus={() => { focused.current = true; }}
+      onChange={(e) => { const t = e.target.value; setText(t); const v = parse(t); if (v != null) onCommit(v); }}
+      onBlur={() => { focused.current = false; const v = parse(text); if (v == null) setText(String(value)); else { setText(String(v)); onCommit(v); } }}
+    />
+  );
+}
 
 const Metric = ({ l, v, danger }) => (
   <div style={{ background: "#f5f4ef", borderRadius: 8, padding: 12 }}>
@@ -311,6 +362,11 @@ export default function Apuntala() {
   const [proyecto, setProyecto] = useState({ obra: "", elementoId: "", evaluador: "", civ: "", fecha: new Date().toLocaleDateString("es-VE") });
   const [ejemploCargado, setEjemploCargado] = useState(null);
   const [estabilidad, setEstabilidad] = useState("C3");
+  const [tipoCalculo, setTipoCalculo] = useState("columna");
+  const [viga, setViga] = useState({ L: 5, at: 4, wpp: 190 });
+  const [muro, setMuro] = useState({ H: 4, ha: 3, db: 3, Lp: 4, Lt: 4, st: 2, napoyos: 1 });
+
+  useEffect(() => { if (typeof window !== "undefined") window.scrollTo({ top: 0, left: 0 }); }, [paso]);
 
   const alcanceOK = alcance.every(Boolean);
   const claseObj = CLASES.find((c) => c.id === clase);
@@ -325,6 +381,14 @@ export default function Apuntala() {
   const res = useMemo(() => {
     try { return calcular(inputsCalc); } catch (e) { return null; }
   }, [JSON.stringify(inputsCalc)]);
+
+  const resViga = useMemo(() => {
+    try { return calcularViga({ L: viga.L, at: viga.at, wpp: viga.wpp, q: inp.q, rd: rdEfectivo, qp: qpConf }); } catch (e) { return null; }
+  }, [JSON.stringify(viga), inp.q, rdEfectivo, qpConf]);
+
+  const resMuro = useMemo(() => {
+    try { return calcularMuro(muro); } catch (e) { return null; }
+  }, [JSON.stringify(muro)]);
 
   const cargarEjemplo = (e) => {
     setClase(e.clase); setRdCustom("");
@@ -489,7 +553,7 @@ export default function Apuntala() {
           ].map(([l, k]) => (
             <div key={k}>
               <label style={S.label}>{l}</label>
-              <input style={S.input} type="number" min="0" value={lineas[k]} onChange={(e) => setLineas((v) => ({ ...v, [k]: parseInt(e.target.value) || 0 }))} />
+              <NumField entero min={0} value={lineas[k]} onCommit={(n) => setLineas((v) => ({ ...v, [k]: n }))} />
             </div>
           ))}
         </div>
@@ -507,7 +571,7 @@ export default function Apuntala() {
       <div style={S.card}>
         <p style={{ ...S.h, fontSize: 14 }}>Matriz de extensión según el elemento dañado (Tabla 3)</p>
         {TABLA3.map((t) => (
-          <div key={t.id} onClick={() => setElemento(t.id)}
+          <div key={t.id} onClick={() => { setElemento(t.id); setTipoCalculo(MAPA_CALC[t.id] || "columna"); }}
             style={{ ...S.row, cursor: "pointer", border: elemento === t.id ? `2px solid ${RAMP.azul.mid}` : S.row.border }}>
             <p style={{ margin: "0 0 4px", fontSize: 13, fontWeight: 600 }}>{t.t}</p>
             <p style={{ margin: 0, fontSize: 12, color: "#55544f", lineHeight: 1.5 }}>
@@ -566,7 +630,7 @@ export default function Apuntala() {
             {puntalSel === t.id && (
               <span style={{ display: "flex", gap: 6, alignItems: "center" }} onClick={(e) => e.stopPropagation()}>
                 <span style={{ fontSize: 11, color: "#6b6a64" }}>Qp confirmado:</span>
-                <input style={{ ...S.input, width: 70, textAlign: "center" }} value={qpConf} onChange={(e) => setQpConf(parseFloat(e.target.value.replace(",", ".")) || 0)} />
+                <NumField min={0.1} value={qpConf} onCommit={(n) => setQpConf(n)} style={{ ...S.input, width: 70, textAlign: "center" }} />
                 <span style={{ fontSize: 11, color: "#6b6a64" }}>tonf</span>
               </span>
             )}
@@ -618,11 +682,128 @@ export default function Apuntala() {
     </>
   );
 
+  const CalculoViga = () => (
+    <>
+      <div style={S.card}>
+        <p style={{ ...S.h, fontSize: 14 }}>Datos de la viga</p>
+        <p style={S.sub}>Se apuntala la luz completa más ¼ de luz hacia cada apoyo (7.2), con puntales directamente bajo la viga y cabezal continuo (9.2).</p>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 10 }}>
+          <div><label style={S.label}>Luz de la viga L (m)</label><NumField min={0.5} value={viga.L} onCommit={(n) => setViga((v) => ({ ...v, L: n }))} /></div>
+          <div><label style={S.label}>Ancho tributario de losa (m)</label><NumField min={0} value={viga.at} onCommit={(n) => setViga((v) => ({ ...v, at: n }))} />
+            <p style={{ margin: "4px 0 0", fontSize: 10.5, color: "#8a887f", lineHeight: 1.4 }}>Semisuma de las luces de losa a cada lado de la viga (borde: mitad de la única luz + volado).</p></div>
+          <div><label style={S.label}>Peso propio de la viga (kgf/m)</label><NumField min={0} value={viga.wpp} onCommit={(n) => setViga((v) => ({ ...v, wpp: n }))} />
+            <p style={{ margin: "4px 0 0", fontSize: 10.5, color: "#8a887f", lineHeight: 1.4 }}>≈ b(cm) × h(cm) × 0,25 kgf/m (concreto 2500 kgf/m³, Tabla 6). Ej.: 30×50 → 375; descuente si q ya lo incluye.</p></div>
+          <div><label style={S.label}>q de la losa (kgf/m²)</label><NumField min={0} value={inp.q} onCommit={(n) => setInp((v) => ({ ...v, q: n }))} /></div>
+          <div><label style={S.label}>Qp del puntal (tonf)</label><NumField min={0.1} value={qpConf} onCommit={(n) => setQpConf(n)} /></div>
+          <div>
+            <label style={S.label}>Clase de daño</label>
+            <select style={S.input} value={clase || ""} onChange={(e) => setClase(e.target.value)}>
+              <option value="" disabled>Seleccione</option>
+              <option value="III">III · moderado (rd 0,50)</option>
+              <option value="IV">IV · severo (rd 0,25)</option>
+              <option value="V">V · completo (rd 0,00)</option>
+            </select>
+          </div>
+        </div>
+      </div>
+      {resViga && clase && requiere && (
+        <div style={S.card}>
+          <p style={{ ...S.h, fontSize: 14 }}>Resultados — apuntalamiento de viga</p>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))", gap: 10 }}>
+            <Metric l="w = q·at + pp" v={`${resViga.w} tonf/m`} />
+            <Metric l="La = 1,5·L (7.2)" v={`${resViga.La} m`} />
+            <Metric l="W = w·La" v={`${resViga.W} tonf`} />
+            <Metric l={`WA = W·(1−${rdEfectivo})`} v={`${resViga.WA} tonf`} />
+            <Metric l="N por carga" v={resViga.Ncarga} />
+            <Metric l="N por sep. ≤ 0,4 m" v={resViga.Nsep} danger={resViga.Nsep > resViga.Ncarga} />
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 10, marginTop: 10 }}>
+            <Metric l="Puntales bajo la viga" v={resViga.N} />
+            <Metric l="Separación resultante" v={`${resViga.sep} m`} />
+            <Metric l="Reacción por apoyo ≈ WA/2" v={`${resViga.Rapoyo} tonf`} />
+          </div>
+          {resViga.Nsep > resViga.Ncarga && (
+            <div style={S.banner("azul")}>El número de puntales lo gobierna la separación máxima de 0,4 m entre ejes (8.4.3), no la carga: instale {resViga.N} puntales con cabezal continuo.</div>
+          )}
+          {(clase === "IV" || clase === "V") && (
+            <div style={S.banner("rojo")}>Daño {clase === "IV" ? "severo" : "completo"}: apuntale además la losa adyacente dentro de su ancho tributario para descargar la viga y evitar reacciones concentradas (9.2.2){clase === "V" ? "; restrinja el acceso e intervenga desde zona segura (Figura 3)" : ""}.</div>
+          )}
+          <div style={S.banner("ambar")}>
+            Verifique los apoyos que reciben la carga desviada (≈ {resViga.Rapoyo} tonf por extremo); si se sobrecargan, extienda el apuntalamiento a sus áreas tributarias (Tabla 3). rd de la Tabla A.1 aplicado por analogía al procedimiento de columnas; el ingeniero puede ajustarlo evaluando la sección remanente (9.6.3).
+          </div>
+          <div style={{ marginTop: 12, display: "flex", justifyContent: "flex-end" }}>
+            <button style={S.btnP} onClick={() => setPaso(6)}>Generar memoria de cálculo →</button>
+          </div>
+        </div>
+      )}
+      {clase && !requiere && <div style={S.card}><div style={S.banner("verde")}>La clase seleccionada ({clase}) no requiere apuntalamiento.</div></div>}
+      {!clase && <div style={S.card}><div style={S.banner("ambar")}>Seleccione la clase de daño para ejecutar el cálculo.</div></div>}
+    </>
+  );
+
+  const CalculoMuro = () => (
+    <>
+      <div style={S.card}>
+        <p style={{ ...S.h, fontSize: 14 }}>Datos del muro y las tornapuntas (9.4)</p>
+        <p style={S.sub}>Verificador geométrico y especificación del sistema lateral de retención. El dimensionamiento de las fuerzas laterales lo define el ingeniero estructural.</p>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 10 }}>
+          <div><label style={S.label}>Altura del muro H (m)</label><NumField min={0.5} value={muro.H} onCommit={(n) => setMuro((v) => ({ ...v, H: n }))} /></div>
+          <div><label style={S.label}>Altura del apoyo superior (m)</label><NumField min={0.5} value={muro.ha} onCommit={(n) => setMuro((v) => ({ ...v, ha: n }))} />
+            <p style={{ margin: "4px 0 0", fontSize: 10.5, color: "#8a887f", lineHeight: 1.4 }}>Debe coincidir con un elemento de contraste tras el muro: entrepiso, viga de corona o muro perpendicular (9.4.2).</p></div>
+          <div><label style={S.label}>Distancia de la base (m)</label><NumField min={0.3} value={muro.db} onCommit={(n) => setMuro((v) => ({ ...v, db: n }))} /></div>
+          <div><label style={S.label}>Paño afectado (m)</label><NumField min={0.5} value={muro.Lp} onCommit={(n) => setMuro((v) => ({ ...v, Lp: n }))} /></div>
+          <div><label style={S.label}>Paño típico adyacente (m)</label><NumField min={0} value={muro.Lt} onCommit={(n) => setMuro((v) => ({ ...v, Lt: n }))} />
+            <p style={{ margin: "4px 0 0", fontSize: 10.5, color: "#8a887f", lineHeight: 1.4 }}>La extensión cubre el paño afectado + un paño a cada lado (Tabla 3).</p></div>
+          <div><label style={S.label}>Separación entre tornapuntas (m)</label><NumField min={0.3} value={muro.st} onCommit={(n) => setMuro((v) => ({ ...v, st: n }))} />
+            <p style={{ margin: "4px 0 0", fontSize: 10.5, color: "#8a887f", lineHeight: 1.4 }}>La define el ingeniero; usualmente en coincidencia con machones, juntas o módulos del paño.</p></div>
+          <div><label style={S.label}>Niveles de apoyo (entrepisos)</label><NumField entero min={1} value={muro.napoyos} onCommit={(n) => setMuro((v) => ({ ...v, napoyos: n }))} />
+            <p style={{ margin: "4px 0 0", fontSize: 10.5, color: "#8a887f", lineHeight: 1.4 }}>Puntos de apoyo a nivel de cada entrepiso que cruce el muro (9.4).</p></div>
+        </div>
+      </div>
+      {resMuro && (
+        <div style={S.card}>
+          <p style={{ ...S.h, fontSize: 14 }}>Especificación del sistema lateral</p>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 10 }}>
+            <Metric l="Ángulo de la tornapunta" v={`${resMuro.ang}°`} danger={!resMuro.angOK} />
+            <Metric l="Longitud de la diagonal" v={`${resMuro.diag} m`} />
+            <Metric l="Longitud a cubrir" v={`${resMuro.Lc} m`} />
+            <Metric l="Tornapuntas por nivel" v={resMuro.porNivel} />
+            <Metric l="Total de tornapuntas" v={resMuro.total} />
+            <Metric l="Peso ref. del paño (Tabla 6)" v={`${resMuro.peso} tonf`} />
+          </div>
+          <div style={S.banner(resMuro.angOK ? "verde" : "rojo")}>
+            {resMuro.angOK ? `Ángulo dentro del rango admisible 30°–60° (óptimo 45°).` : `Ángulo fuera del rango 30°–60°: reubique la base o el punto de apoyo superior antes de instalar (9.4.2).`}
+          </div>
+          {!resMuro.alturaOK && (
+            <div style={S.banner("rojo")}>H &gt; 7,0 m: los elementos deben ser de acero y calcularse específicamente — caso marcado para proyecto especial (9.4.3).</div>
+          )}
+          <div style={S.banner("ambar")}>
+            Bases ancladas contra deslizamiento y levantamiento (varillas, empotramiento o lastre) con cabezas protegidas; variante muleta en suelo inclinado u obstáculos; nunca trabajar del lado hacia el cual se inclina el muro. Si debe quedar paso libre: tirantes de guayas ancladas, tensado uniforme y aristas protegidas (9.4.4). El peso del paño es referencial (mampostería frisada 330 kgf/m²): las fuerzas de diseño del sistema las define el ingeniero estructural.
+          </div>
+          <div style={{ marginTop: 12, display: "flex", justifyContent: "flex-end" }}>
+            <button style={S.btnP} onClick={() => setPaso(6)}>Generar memoria →</button>
+          </div>
+        </div>
+      )}
+    </>
+  );
+
   const PasoCalculo = () => (
     <>
       <div style={S.card}>
-        <p style={S.h}>Paso 5 · Cálculo del apuntalamiento (8.4 y Anexo A)</p>
-        <p style={S.sub}>Introduzca su caso o cargue un ejemplo oficial para ver el procedimiento resuelto.</p>
+        <p style={S.h}>Paso 5 · Cálculo del apuntalamiento</p>
+        <p style={S.sub}>Tipo de cálculo sincronizado con el elemento del Paso 3; puede cambiarlo aquí.</p>
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 12 }}>
+          {[["columna", "Columna (Anexo A)"], ["viga", "Viga (7.2 · 8.4 · 9.2)"], ["muro", "Muro (9.4)"]].map(([id, t]) => (
+            <button key={id} type="button" onClick={() => setTipoCalculo(id)}
+              style={{ fontSize: 13, padding: "8px 14px", borderRadius: 8, cursor: "pointer", fontFamily: "inherit", border: tipoCalculo === id ? "1px solid #1f1f1d" : "1px solid #cfcdc4", background: tipoCalculo === id ? "#1f1f1d" : "#fff", color: tipoCalculo === id ? "#fff" : "#55544f", fontWeight: tipoCalculo === id ? 600 : 400 }}>
+              {t}
+            </button>
+          ))}
+        </div>
+        {tipoCalculo === "columna" && <p style={{ ...S.sub, marginBottom: 12 }}>Introduzca su caso o cargue un ejemplo oficial para ver el procedimiento resuelto.</p>}
+        {tipoCalculo !== "columna" && <p style={{ ...S.sub, marginBottom: 4 }}>Los tres ejemplos oficiales del Anexo A corresponden al cálculo de columnas.</p>}
+        {tipoCalculo === "columna" && (<>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 8, marginBottom: 6 }}>
           {EJEMPLOS.map((e) => (
             <button key={e.id} type="button" onClick={() => cargarEjemplo(e)}
@@ -641,8 +822,10 @@ export default function Apuntala() {
         <p style={{ fontSize: 11, color: MOTOR_OK ? RAMP.verde.mid : RAMP.rojo.mid, margin: "4px 0 0" }}>
           {MOTOR_OK ? "✓ Motor de cálculo verificado automáticamente contra los tres casos del Anexo A." : "✗ Advertencia: la autoverificación contra el Anexo A no coincidió — revise los resultados manualmente."}
         </p>
+        </>)}
       </div>
 
+      {tipoCalculo !== "muro" && (
       <div style={S.card}>
         <p style={{ ...S.h, fontSize: 14 }}>Calculadora auxiliar de q (8.4.1 y Tabla 6)</p>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 10 }}>
@@ -657,15 +840,15 @@ export default function Apuntala() {
           </div>
           <div>
             <label style={S.label}>Acabados, friso y otros permanentes (kgf/m²)</label>
-            <input style={S.input} type="number" value={qAux.acabados} onChange={(e) => setQAux((v) => ({ ...v, acabados: e.target.value }))} />
+            <NumField min={0} value={qAux.acabados} onCommit={(n) => setQAux((v) => ({ ...v, acabados: n }))} />
           </div>
           <div>
             <label style={S.label}>Cargas variables (ocupación / cuadrillas) (kgf/m²)</label>
-            <input style={S.input} type="number" value={qAux.variables} onChange={(e) => setQAux((v) => ({ ...v, variables: e.target.value }))} />
+            <NumField min={0} value={qAux.variables} onCommit={(n) => setQAux((v) => ({ ...v, variables: n }))} />
           </div>
           <div>
             <label style={S.label}>Cargas concentradas identificadas (tonf, se suman a PT)</label>
-            <input style={S.input} type="number" value={inp.concentradas} onChange={(e) => setInp((v) => ({ ...v, concentradas: parseFloat(e.target.value) || 0 }))} />
+            <NumField min={0} value={inp.concentradas} onCommit={(n) => setInp((v) => ({ ...v, concentradas: n }))} />
           </div>
         </div>
         <label style={{ fontSize: 12, display: "flex", gap: 8, alignItems: "center", marginTop: 10 }}>
@@ -680,7 +863,9 @@ export default function Apuntala() {
           <span style={{ fontSize: 12, color: "#6b6a64" }}>o introduzca q manualmente abajo. Tabla 6: concreto 2500 kgf/m³ · acero 7850 kgf/m³ · mampostería frisada 330 · losa maciza 250 (e=10 cm) · nervada 500 · paredes 75 · personal 50.</span>
         </div>
       </div>
+      )}
 
+      {tipoCalculo === "columna" && (<>
       <div style={S.card}>
         <p style={{ ...S.h, fontSize: 14 }}>Datos del elemento (Anexo A, Paso 1)</p>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 10 }}>
@@ -697,7 +882,7 @@ export default function Apuntala() {
           </div>
           <div>
             <label style={S.label}>Niveles del edificio (PB + pisos)</label>
-            <input style={S.input} type="number" min="1" value={inp.niveles} onChange={(e) => { const n = parseInt(e.target.value) || 1; setInp((v) => ({ ...v, niveles: n, nivel: Math.min(v.nivel, n - 1), ns: Math.max(1, n - Math.min(v.nivel, n - 1)) })); }} />
+            <NumField entero min={1} value={inp.niveles} onCommit={(n) => setInp((v) => { const nivel = Math.min(Math.max(v.nivel, -(v.sotanos || 0)), n - 1); return { ...v, niveles: n, nivel, ns: Math.max(1, n - nivel) }; })} />
           </div>
           <div>
             <label style={S.label}>Sótanos (0 a 4)</label>
@@ -716,21 +901,21 @@ export default function Apuntala() {
           </div>
           <div>
             <label style={S.label}>Losas por encima ns</label>
-            <input style={S.input} type="number" min="1" value={inp.ns} onChange={(e) => setInp((v) => ({ ...v, ns: parseInt(e.target.value) || 1 }))} />
+            <NumField entero min={1} value={inp.ns} onCommit={(n) => setInp((v) => ({ ...v, ns: n }))} />
           </div>
-          <div><label style={S.label}>L1 (m)</label><input style={S.input} type="number" step="0.1" value={inp.L1} onChange={(e) => setInp((v) => ({ ...v, L1: parseFloat(e.target.value) || 0 }))} /></div>
+          <div><label style={S.label}>L1 (m)</label><NumField min={0} value={inp.L1} onCommit={(n) => setInp((v) => ({ ...v, L1: n }))} /></div>
           <div>
             <label style={S.label}>L2 (m)</label>
-            <input style={S.input} type="number" step="0.1" value={inp.L2} onChange={(e) => setInp((v) => ({ ...v, L2: parseFloat(e.target.value) || 0 }))} />
+            <NumField min={0} value={inp.L2} onCommit={(n) => setInp((v) => ({ ...v, L2: n }))} />
             <p style={{ margin: "4px 0 0", fontSize: 10.5, color: "#8a887f", lineHeight: 1.4 }}>
               AT = L1 × L2 = {r2(inp.L1 * inp.L2)} m². L1 y L2 son los anchos tributarios (7.1): en cada dirección, la semisuma de las luces adyacentes a la columna. Central: (luz izq + luz der)/2 en ambas. Lateral: semisuma paralela al borde y mitad de la única luz perpendicular. Esquinera: mitad de la única luz en cada dirección. Sume los volados completos si existen.
             </p>
           </div>
-          <div><label style={S.label}>q (kgf/m²)</label><input style={S.input} type="number" value={inp.q} onChange={(e) => setInp((v) => ({ ...v, q: parseFloat(e.target.value) || 0 }))} /></div>
-          <div><label style={S.label}>Qp del puntal (tonf)</label><input style={S.input} type="number" step="0.5" value={qpConf} onChange={(e) => setQpConf(parseFloat(e.target.value) || 0)} /></div>
-          <div><label style={S.label}>Viga b (cm)</label><input style={S.input} type="number" value={inp.b} onChange={(e) => setInp((v) => ({ ...v, b: parseFloat(e.target.value) || 0 }))} /></div>
-          <div><label style={S.label}>Viga d útil (cm)</label><input style={S.input} type="number" value={inp.d} onChange={(e) => setInp((v) => ({ ...v, d: parseFloat(e.target.value) || 0 }))} /></div>
-          <div><label style={S.label}>f′c (kgf/cm²)</label><input style={S.input} type="number" value={inp.fc} onChange={(e) => setInp((v) => ({ ...v, fc: parseFloat(e.target.value) || 0 }))} /></div>
+          <div><label style={S.label}>q (kgf/m²)</label><NumField min={0} value={inp.q} onCommit={(n) => setInp((v) => ({ ...v, q: n }))} /></div>
+          <div><label style={S.label}>Qp del puntal (tonf)</label><NumField min={0.1} value={qpConf} onCommit={(n) => setQpConf(n)} /></div>
+          <div><label style={S.label}>Viga b (cm)</label><NumField min={1} value={inp.b} onCommit={(n) => setInp((v) => ({ ...v, b: n }))} /></div>
+          <div><label style={S.label}>Viga d útil (cm)</label><NumField min={1} value={inp.d} onCommit={(n) => setInp((v) => ({ ...v, d: n }))} /></div>
+          <div><label style={S.label}>f′c (kgf/cm²)</label><NumField min={1} value={inp.fc} onCommit={(n) => setInp((v) => ({ ...v, fc: n }))} /></div>
           <div>
             <label style={S.label}>Clase de daño</label>
             <select style={S.input} value={clase || ""} onChange={(e) => setClase(e.target.value)}>
@@ -805,6 +990,9 @@ export default function Apuntala() {
       )}
       {clase && !requiere && <div style={{ ...S.card }}><div style={S.banner("verde")}>La clase seleccionada ({clase}) no requiere apuntalamiento: no aplica el cálculo del Anexo A.</div></div>}
       {!clase && <div style={S.card}><div style={S.banner("ambar")}>Seleccione la clase de daño (Paso 2 o en el formulario de datos) para ejecutar el cálculo.</div></div>}
+      </>)}
+      {tipoCalculo === "viga" && CalculoViga()}
+      {tipoCalculo === "muro" && CalculoMuro()}
     </>
   );
 
@@ -865,9 +1053,9 @@ export default function Apuntala() {
         )}
         {estabilidad === "C3" && <p style={{ margin: "0 0 10px" }}></p>}
 
-        {res && requiere && (
+        {tipoCalculo === "columna" && res && requiere && (
           <>
-            <p style={{ ...S.h, fontSize: 13 }}>5. Cálculo (Anexo A) — datos y desarrollo</p>
+            <p style={{ ...S.h, fontSize: 13 }}>5. Cálculo de columna (Anexo A) — datos y desarrollo</p>
             <p style={{ fontSize: 12, color: "#55544f", margin: "0 0 6px" }}>
               Posición {inp.pos} (nv = {res.nv}) · nivel {nombreNivel(inp.nivel)} de {inp.niveles} niveles{inp.sotanos > 0 ? ` + ${inp.sotanos} sótano${inp.sotanos > 1 ? "s" : ""}` : ""} · ns = {inp.ns} · L1 = {inp.L1} m · L2 = {inp.L2} m · q = {inp.q} kgf/m²{inp.concentradas ? ` · concentradas = ${inp.concentradas} tonf` : ""} · viga b×d = {inp.b}×{inp.d} cm · f′c = {inp.fc} kgf/cm².
             </p>
@@ -892,6 +1080,31 @@ export default function Apuntala() {
           </>
         )}
 
+        {tipoCalculo === "viga" && resViga && requiere && (
+          <>
+            <p style={{ ...S.h, fontSize: 13 }}>5. Cálculo de viga (reglas 7.2, 8.4.3 y 9.2)</p>
+            <p style={{ fontSize: 12, color: "#55544f", margin: "0 0 6px" }}>
+              Luz L = {viga.L} m · ancho tributario = {viga.at} m · peso propio = {viga.wpp} kgf/m · q = {inp.q} kgf/m² · clase {clase} (rd = {rdEfectivo}) · Qp = {qpConf} tonf.
+            </p>
+            <p style={{ fontSize: 12, color: "#55544f", margin: "0 0 6px", lineHeight: 1.7 }}>
+              w = {resViga.w} tonf/m · La = 1,5·L = {resViga.La} m (luz + ¼ hacia cada apoyo, 7.2) · W = {resViga.W} tonf · WA = W·(1−rd) = {resViga.WA} tonf · N por carga = {resViga.Ncarga} · N por separación ≤ 0,4 m = {resViga.Nsep} (8.4.3) → <b>{resViga.N} puntales</b> bajo la viga con cabezal continuo, separación resultante {resViga.sep} m · reacción por apoyo ≈ {resViga.Rapoyo} tonf.
+            </p>
+            {(clase === "IV" || clase === "V") && (
+              <p style={{ fontSize: 12, color: RAMP.rojo.mid, margin: "0 0 4px" }}>⚠ Daño {clase === "IV" ? "severo" : "completo"}: apuntalar además la losa adyacente dentro de su ancho tributario (9.2.2).</p>
+            )}
+            <p style={{ fontSize: 12, color: RAMP.ambar.mid, margin: "0 0 10px" }}>⚠ Verificar los apoyos receptores; si se sobrecargan, extender a sus áreas tributarias (Tabla 3). rd de Tabla A.1 aplicado por analogía (ajustable por el ingeniero, 9.6.3).</p>
+          </>
+        )}
+        {tipoCalculo === "muro" && resMuro && (
+          <>
+            <p style={{ ...S.h, fontSize: 13 }}>5. Sistema lateral de retención de muro (9.4)</p>
+            <p style={{ fontSize: 12, color: "#55544f", margin: "0 0 6px", lineHeight: 1.7 }}>
+              H = {muro.H} m · apoyo superior a {muro.ha} m · base a {muro.db} m → ángulo = <b>{resMuro.ang}°</b> ({resMuro.angOK ? "dentro de 30°–60°, óptimo 45°" : "FUERA del rango 30°–60°"}) · diagonal = {resMuro.diag} m · longitud a cubrir = paño {muro.Lp} m + un paño de {muro.Lt} m a cada lado = {resMuro.Lc} m (Tabla 3) · {resMuro.porNivel} tornapuntas por nivel × {muro.napoyos} nivel(es) de entrepiso = <b>{resMuro.total} tornapuntas</b> · peso referencial del paño (Tabla 6): {resMuro.peso} tonf.
+            </p>
+            {!resMuro.alturaOK && <p style={{ fontSize: 12, color: RAMP.rojo.mid, margin: "0 0 4px" }}>⚠ H &gt; 7,0 m: elementos de acero con cálculo específico — proyecto especial (9.4.3).</p>}
+            <p style={{ fontSize: 12, color: RAMP.ambar.mid, margin: "0 0 10px" }}>⚠ Bases ancladas contra deslizamiento y levantamiento; apoyo superior contra elemento de contraste; nunca trabajar del lado de la inclinación; guayas si se requiere paso libre (9.4.4). Las fuerzas de diseño las define el ingeniero estructural.</p>
+          </>
+        )}
         <p style={{ ...S.h, fontSize: 13, marginTop: 12 }}>6. Procedimiento del miembro (capítulo 9)</p>
         {(FICHAS9[elemento] || FICHAS9.columna).pts.map((p, i) => (<p key={i} style={{ fontSize: 12, color: "#55544f", margin: "0 0 3px" }}>✓ {p}</p>))}
         {(FICHAS9[elemento] || FICHAS9.columna).no.map((p, i) => (<p key={i} style={{ fontSize: 12, color: RAMP.rojo.mid, margin: "0 0 3px" }}>✗ {p}</p>))}
